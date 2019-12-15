@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+
+import argparse
+import bs4
+import collections
+import datetime as dt
+import json
+import os
+import re
+import requests
+import urllib.parse
+import webbrowser
+
+
+
+Show = collections.namedtuple("Show", ("cinema", "movie", "extra", "datetime"))
+
+DAYS_SHORT_EN = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"]
+MONTHS_DE = ["januar", "februar", "märz", "april", "mai", "juni", "juli",
+          "august", "september", "oktober", "november", "dezember"]
+
+def _get_month_from_de_name(txt):
+    """Use MONTHS_DE lookup table to obtain the number of a month given as a string"""
+    return MONTHS_DE.index(txt.strip().lower()) + 1
+
+
+def groupby(xs, func, ordered=False):
+    """Group xs based on func and return as a dict or OrderedDict"""
+    groups = {}
+    for x in xs:
+        group = func(x)
+        if group not in groups:
+            groups[group] = []
+        groups[group].append(x)
+    if not ordered:
+        return groups
+    return collections.OrderedDict((key, groups[key]) for key in sorted(groups.keys()))
+
+
+def _reconstruct_content(node):
+    """Recreate text content of a node, transform <br> tags into line brakes"""
+    if isinstance(node, bs4.NavigableString):
+        return str(node)
+    elif node.name == "br":
+        return "\n"
+    # Not a leaf node: recursive descent
+    return "".join([_reconstruct_content(child) for child in node.children])
+
+
+
+# Movie title normalization
+
+def _remove_prefix(txt, prefix):
+    """If txt starts with prefix remove it, otherwise return txt unchanged"""
+    if txt.startswith(prefix):
+        return txt[len(prefix):]
+    return txt
+
+def normalize_title(title):
+    """Split title into a base name and additional properties (OV, etc.)
+    
+    Try to break titles down into a base part which can be used to group shows
+    from different theaters and modifiers that carry additional information
+    about the show, e.g. if it is an original version or 3D.
+
+    Rules are based on past observations of how each theater specifies its
+    movie titles.
+    """
+    title = title.lower()
+    title = title.replace("–", "-")
+    extra = set()
+    # Apply rules until title does not change any further
+    title_old = None
+    while title_old != title:
+        title_old = title
+        # Original mit Untertiteln
+        if title.endswith(" omu"):
+            extra.add("OmU")
+            title = title[:-4]
+        if title.endswith(" (omu)"):
+            extra.add("OmU")
+            title = title[:-6]
+        # Originalversion
+        if title.endswith(" ov"):
+            extra.add("OV")
+            title = title[:-3]
+        if title.endswith(" (ov)"):
+            extra.add("OV")
+            title = title[:-5]
+        # Deutsche Fassung
+        if title.endswith(" df"):
+            title = title[:-3]
+        if title.endswith(" (df)"):
+            title = title[:-5]
+        # 2D
+        if title.endswith(" 2d"):
+            title = title[:-3]
+        if title.endswith(" (2d)"):
+            title = title[:-5]
+        # 3D
+        if title.endswith(" 3d"):
+            extra.add("3D")
+            title = title[:-3]
+        if title.endswith(" (3d)"):
+            extra.add("3D")
+            title = title[:-5]
+        # Murnau *-end
+        if title.endswith("*"):
+            title = title[:-1]
+        # CineStar Zusätze
+        title = _remove_prefix(title, "original monday: ")
+        title = _remove_prefix(title, "original tuesday: ")
+        title = _remove_prefix(title, "original wednesday: ")
+        title = _remove_prefix(title, "original thursday: ")
+        title = _remove_prefix(title, "original friday: ")
+        title = _remove_prefix(title, "original saturday: ")
+        title = _remove_prefix(title, "original sunday: ")
+        # Title in special quotation marks
+        idx_quote_start = title.find("„")
+        idx_quote_close = title.find("“")
+        if idx_quote_start >= 0 and idx_quote_close >= 0:
+            title = title[idx_quote_start+1:idx_quote_close]
+        # ... Preview:
+        preview_idx = title.find("preview: ")
+        if preview_idx >= 0:
+            title = title[(preview_idx+9):]
+        # ... Präsentiert:
+        preview_idx = title.find("präsentiert: ")
+        if preview_idx >= 0:
+            title = title[(preview_idx+13):]
+        # Kinderkino
+        if title.startswith("schulkino: "):
+            extra.add("Schulkino")
+            title = title[11:]
+        # Cinefete
+        title = _remove_prefix(title, "cinéfête: ")
+        # Rückblende - Film Ab!
+        title = _remove_prefix(title, "rückblende - film ab!: ")
+        # Remove remaining outer spaces after every iteration
+        title = title.strip()
+    # Captitalize all words
+    title = title.title()
+    # Join extras into parenthesized list
+    if len(extra) == 0:
+        return title, ""
+    return title, "(" + ", ".join(sorted(extra)) + ")"
+
+
+
+# Theaters
+
+class Theater:
+    """Base class for movie theater website crawler"""
+
+    def get_shows(self):
+        """Overwrite in subclass, this should return a list of Shows"""
+        return []
+
+    def _fetch_soup(self, url):
+        """Download the website behind the URL and parse with BeautifulSoup"""
+        res = requests.get(url)
+        res.encoding = "utf-8"
+        return bs4.BeautifulSoup(res.text, "html.parser")
+
+    def _fetch_json(self, url):
+        """Download the website behind the URL and parse as json"""
+        res = requests.get(url)
+        res.encoding = "utf-8"
+        return json.loads(res.text)
+
+
+class CapitolPalatin(Theater):
+    """CAPITOL, PALATIN Mainz
+    
+    Showtimes on their website is given in the form of tables that each contain
+    one week of shows.
+    """
+
+    def __init__(self, name, url):
+        self.name = name
+        self.soup = self._fetch_soup(url)
+
+    def get_shows(self):
+        shows = []
+        for table in self.soup.findAll("table"):
+            # Case 1: regular program
+            if self._is_regular(table):
+                shows.extend(self._get_shows_regular(table))
+            # Case 2: special program
+            elif self._is_special(table):
+                shows.extend(self._get_shows_special(table))
+        return shows
+
+    # Regular program
+
+    def _is_regular(self, table):
+        return table.find(text=re.compile(r"Filmprogramm"))
+
+    def _get_shows_regular(self, table):
+        shows = []
+        for tr in table.findAll("tr"):
+            cells = tr.findAll(["td", "th"])
+            assert len(cells) == 8
+            # Reconstruct title (keep linebreaks intact)
+            title = _reconstruct_content(cells[0])
+            # Header row
+            if "Filmprogramm" in title:
+                *_, line = title.splitlines()
+                # First cell of header row contains date range
+                start, end = self._split_week_range(line)
+                days = [start + dt.timedelta(days=n) for n in range((end - start).days + 1)]
+            # Movie row
+            else:
+                title, extra = normalize_title(title.splitlines()[0])
+                shows.extend(self._parse_movie_row(days, cells[1:], title, extra))
+        return shows
+
+    def _split_week_range(self, line):
+        match = re.match(r"([0-3][0-9])\.\s*([a-zA-Z]*)?\s*-\s*([0-3][0-9])\.\s*([a-zA-Z]*)", line)
+        assert match is not None
+        sd, sm, ed, em = match.groups()
+        # If start and end are in the same month, the month is named only once
+        if not sm:
+            sm = em
+        start = dt.date(2019, _get_month_from_de_name(sm), int(sd))
+        end   = dt.date(2019, _get_month_from_de_name(em), int(ed))
+        if end < start:
+            end = dt.date(end.year + 1, end.month, end.day)
+        return start, end
+
+    def _parse_movie_row(self, days, cells, title, extra):
+        shows = []
+        for day, cell in zip(days, cells):
+            for time in cell.children:
+                if time.string is None:
+                    continue
+                try:
+                    hour, minute = time.string.split(".")
+                except ValueError:
+                    continue # TODO
+                time = dt.time(int(hour), int(minute), 0)
+                shows.append(Show(self.name, title, extra, dt.datetime.combine(day, time)))
+        return shows
+
+    # Sonderveranstaltungen
+
+    def _is_special(self, table):
+        return table.find(text=re.compile(r"Sonderveranstaltungen"))
+
+    def _get_shows_special(self, table):
+        # TODO
+        return []
+
+
+class Murnau(Theater):
+    """Murnau-Filmtheater Wiesbaden
+    
+    All shows are listed on one long page.
+    """
+
+    def __init__(self, name, url):
+        self.name = name
+        self.soup = self._fetch_soup(url)
+
+    def get_shows(self):
+        return [self._parse_show(row) for row in self.soup.findAll("div", { "class": "views-row" })]
+
+    def _parse_show(self, row):
+        date = row.find("div", { "class": "views-field-field-cinema-show-date" }).text.strip()
+        time = row.find("div", { "class": "views-field-field-cinema-show-date-1" }).text.strip()
+        title = row.find("div", { "class": "views-field-field-cinema-show-movie" }).text.strip()
+        title, extra = normalize_title(title)
+        datetime_str = (date[3:] + " " + time[:-3]).strip()
+        datetime = dt.datetime.strptime(datetime_str, "%d.%m.%Y %H:%M")
+        return Show(self.name, title, extra, datetime)
+
+
+class Caligari(Theater):
+    """Caligari Filmbühne Wiesbaden
+    
+    Shows are given as a list, but the list is distributed across multiple
+    pages.
+    """
+
+    def __init__(self, name, init_url):
+        self.name = name
+        # Fetch the first page
+        first_soup = self._fetch_soup(init_url)
+        self.soups = [first_soup]
+        # Also fetch all further pages based on the menu on the first page
+        pages_div = first_soup.find("div", attrs={ "class": "SP-paging-pages" })
+        for a in pages_div.findAll("a"):
+            url = init_url + a["href"]
+            self.soups.append(self._fetch_soup(url))
+
+    def get_shows(self):
+        shows = []
+        for soup in self.soups:
+            assert len(soup.findAll("table")) == 1
+            shows.extend(self._parse_page(soup))
+        return shows
+
+    def _parse_page(self, soup):
+        shows = []
+        for row in soup.findAll("tr"):
+            tds = row.findAll("td")
+            if len(tds) == 4:
+                title, extra = normalize_title(tds[0].text)
+                try:
+                    datetime = dt.datetime.strptime(tds[2].text + tds[3].text, "%d.%m.%Y%H:%M")
+                except ValueError:
+                    continue # TODO
+                shows.append(Show(self.name, title, extra, datetime))
+        return shows
+
+
+class CineStar(Theater):
+    """A CineStar movie theater
+    
+    While the website is a mess, the REST-API that feeds it provides all
+    showtimes with one simple call.
+    """
+
+    def __init__(self, name, init_url):
+        self.name = name
+        self.json = self._fetch_json(init_url)
+
+    def get_shows(self):
+        shows = []
+        for entry in self.json:
+            base_title = entry["title"]
+            for showtime in entry["showtimes"]:
+                attrs = set(showtime["attributes"])
+                title = base_title
+                if "3D" in attrs:
+                    title += " 3D"
+                if "AUDIO_OMU" in attrs or "AUDIO_OmU" in attrs:
+                    title += " (OmU)"
+                elif "AUDIO_OV" in attrs:
+                    title += " (OV)"
+                datetime = dt.datetime.strptime(showtime["datetime"], "%Y-%m-%d %H:%M %Z")
+                title, extra = normalize_title(title)
+                shows.append(Show(self.name, title, extra, datetime))
+        return shows
+
+
+class CinePlex(Theater):
+    """A CinePlex movie theater
+    
+    As for the CineStar, the website is a bit messy, but there is a convenient
+    REST-API.
+    """
+
+    def __init__(self, name, init_url):
+        self.name = name
+        self.json = self._fetch_json(init_url)
+
+    def get_shows(self):
+        shows = []
+        for film in self.json["Films"]:
+            for perf in film["Performances"]:
+                title, extra = normalize_title(film["Titel"] + " " + perf["ReleaseType"])
+                date_string = perf["ActualDate"] + " " + perf["ShowTime"]
+                datetime = dt.datetime.strptime(date_string, "%Y-%m-%d %H:%M:%S")
+                shows.append(Show(perf["SiteName"], title, extra, datetime))
+        return shows
+
+
+
+# Output
+
+def print_cinema_week_block(cinema, shows, print=print):
+    first_line = True
+    # Order shows by start time, align shows with same start time in one row
+    groups_time = groupby(shows, lambda t: t.datetime.time(), ordered=True)
+    for time, shows_time in groups_time.items():
+        out = "<tr{}>".format(" class='tr-cinema'" if first_line else "")
+        days = groupby(shows_time, lambda t: t.datetime.strftime("%a"))
+        for day in DAYS_SHORT_EN:
+            if day in days:
+                out += "<td>{:%H:%M}</td>".format(time)
+            else:
+                out += "<td></td>"
+        out += "<td>{:<20}</td>".format(cinema if first_line else "")
+        out += "</tr>"
+        print(out)
+        first_line = False
+
+
+def print_shows(shows, print=print):
+    print("<!doctype html>")
+    print("<html>")
+    print("<head>")
+    print("<meta charset='utf-8'>")
+    print("<title>Spielzeiten</title>")
+    print("<style>")
+    print("body{font-family:'Liberation Sans','Arial',sans-serif;font-size:10.5pt;}")
+    print("h1{margin:30px 5px;font-weight:bold;font-size:24pt;}")
+    print("h2{margin:40px 5px 10px 5px;font-weight:bold;font-size:18pt;}")
+    print("p{margin:10px 5px;}")
+    print("a{text-decoration:underline;color:#003366;}")
+    print("a:hover{color:#336699}")
+    print("table{min-width:60em;margin:20px 5px;border:0;border-top:1px solid #000000;border-spacing:0;}")
+    print("tr:last-child *{padding-bottom:0.6em;}")
+    print("th{padding-top:1em;text-align:center;font-weight:bold;width:4.5em;}")
+    print("td{text-align:center;}")
+    print("th:nth-child(odd){background-color:#EEEEEE;}")
+    print("td:nth-child(odd){background-color:#EEEEEE;}")
+    print("th:last-child{padding-left:1em;padding-right:1em;text-align:left;width:inherit;}")
+    print("td:last-child{padding-left:1em;padding-right:1em;text-align:left;width:inherit;}")
+    print("tr.tr-cinema td{padding-top:1.2em;}")
+    print("ul{margin:10px 5px;padding:0;columns:19em auto;column-gap:1.5em;max-width:60em;list-style-position:inside;}")
+    print("li{padding-left:1em;text-indent:-1em;break-inside:avoid;}")
+    print("</style>")
+    print("</head>")
+    print("<body>")
+    print("<h1>Spielzeiten</h1>")
+    print("<p>{:%a %Y-%m-%d %H:%M:%S}</p>".format(dt.datetime.now()))
+
+    # A "cinema week" starts on thursday
+    fweek = lambda t: (t.datetime - dt.timedelta(days=3)).strftime("%Y-%W")
+    # Outermost grouping: by "cinema week"
+    groups_week = groupby(shows, fweek, ordered=True)
+    for week, shows_week in groups_week.items():
+        week_s = dt.datetime.strptime(week + "-1", "%Y-%W-%w") + dt.timedelta(days=3)
+        week_e = week_s + dt.timedelta(days=6)
+        print("<h2>Week from {:%Y-%m-%d} to {:%Y-%m-%d}</h2>".format(week_s, week_e))
+        # List all movies with a show during the week
+        titles = set(show.movie for show in shows_week)
+        print("<ul>")
+        for title in sorted(titles):
+            print("<li>{}</li>".format(title))
+        print("</ul>")
+        # Group by movie base title
+        groups_movie = groupby(shows_week, lambda t: t.movie, ordered=True)
+        for movie, shows_movie in groups_movie.items():
+            # Group by movie extra properties (3D, OV, ...)
+            groups_extra = groupby(shows_movie, lambda t: t.extra, ordered=True)
+            for extra, shows_extra in groups_extra.items():
+                # Print a table with days of the week-columns and showtime-rows
+                print("<table>")
+                print("<tr>")
+                print("<th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th>".format(*DAYS_SHORT_EN))
+                # Use the base title to provide a link that opens the imdb
+                # search page with the base title queried
+                print("<th><a href='https://www.imdb.com/find?q={}'>{}</a> {}</th>".format(urllib.parse.quote_plus(movie), movie, extra))
+                print("</tr>")
+                # Print one theater after the other
+                groups_cinema = groupby(shows_extra, lambda t: t.cinema, ordered=True)
+                for cinema, shows_cinema in groups_cinema.items():
+                    print_cinema_week_block(cinema, shows_cinema, print=print)
+                print("</table>")
+    print("</body>")
+    print("</html>")
+
+
+
+# CLI parser
+parser = argparse.ArgumentParser(description="""
+    Automatically collect and display movie showtimes from multiple theaters.
+""")
+parser.add_argument("--clean", action="store_true", default=False, help="Remove the output file.")
+parser.add_argument("--no-browser", action="store_true", default=False, help="Do not open the list of showtimes in a browser.")
+parser.add_argument("--update", action="store_true", default=False, help="Update the list of movie showtimes.")
+
+
+# Fetch data from
+cinemas = [
+    (CapitolPalatin, ("CAPITOL", "https://www.programmkinos-mainz.de/programm-capitol/")),
+    (CapitolPalatin, ("PALATIN", "https://www.programmkinos-mainz.de/das-programm-im-palatin/")),
+    (CineStar, ("CineStar Mainz", "https://www.cinestar.de/api/cinema/38/show/")),
+    (Caligari, ("Caligari", "https://www.wiesbaden.de/microsite/caligari/veranstaltungskalender-caligari/index.php")),
+    (Murnau, ("Murnau", "https://www.murnau-stiftung.de/filmtheater")),
+    (CinePlex, ("CinePlex", "https://www.cineplex.de/schedule-week/wiesbaden/"))
+]
+
+# Save output html-page to
+output = "~/.cache/spielzeiten.html"
+
+
+if __name__ == "__main__":
+
+    args = parser.parse_args()
+
+    output = os.path.expanduser(output)
+
+    if args.clean and os.path.isfile(output):
+        os.remove(output)
+
+    dirname = os.path.dirname(output)
+    # Create directory if it does not exist
+    if not os.path.isdir(dirname):
+        os.mkdirs(dirname)
+
+    # Collect shows from all theaters if --update is set
+    if args.update:
+        shows = []
+        for Cinema, args in cinemas:
+            cinema = Cinema(*args)
+            shows.extend(cinema.get_shows())
+        with open(output, "w") as f:
+            print_shows(shows, print=f.write)
+
+    # Open output html file with browser
+    if not args.no_browser and os.path.isfile(output):
+        webbrowser.open(output)
+
