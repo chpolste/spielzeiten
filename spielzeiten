@@ -495,8 +495,8 @@ if __name__ == "__main__":
     # Collect shows from all theaters if --update is set
     if args.update:
         shows = []
-        for Cinema, args in cinemas:
-            cinema = Cinema(*args)
+        for Cinema, cargs in cinemas:
+            cinema = Cinema(*cargs)
             shows.extend(cinema.get_shows())
         with open(output, "w") as f:
             print_shows(shows, print=f.write)
