@@ -220,12 +220,20 @@ class CapitolPalatin(Theater):
         assert match is not None
         sd, sm, ed, em = match.groups()
         # If start and end are in the same month, the month is named only once
+        em = _get_month_from_de_name(em)
         if not sm:
             sm = em
-        start = dt.date(2019, _get_month_from_de_name(sm), int(sd))
-        end   = dt.date(2019, _get_month_from_de_name(em), int(ed))
+        else:
+            sm = _get_month_from_de_name(sm)
+        # Guess year based on months
+        year = dt.datetime.now().year
+        if sm == 1 and em == 1 and dt.datetime.now().month == 12:
+            year += ty + 1
+        start = dt.date(year, sm, int(sd))
+        end   = dt.date(year, em, int(ed))
         if end < start:
             end = dt.date(end.year + 1, end.month, end.day)
+
         return start, end
 
     def _parse_movie_row(self, days, cells, title, extra):
@@ -369,6 +377,18 @@ class CinePlex(Theater):
 
 # Output
 
+def fweek(t):
+    # A "cinema week" starts on thursday
+    tt = t.datetime - dt.timedelta(days=3)
+    ty = tt.year
+    tw = tt.strftime("%W")
+    # 0th-week days of a new year are still part of the 52nd week of the
+    # previous year
+    if tw == "00":
+        tw = "52"
+        ty = ty - 1
+    return str(ty) + "-" + tw
+
 def print_cinema_week_block(cinema, shows, print=print):
     first_line = True
     # Order shows by start time, align shows with same start time in one row
@@ -417,8 +437,6 @@ def print_shows(shows, print=print):
     print("<h1>Spielzeiten</h1>")
     print("<p>{:%a %Y-%m-%d %H:%M:%S}</p>".format(dt.datetime.now()))
 
-    # A "cinema week" starts on thursday
-    fweek = lambda t: (t.datetime - dt.timedelta(days=3)).strftime("%Y-%W")
     # Outermost grouping: by "cinema week"
     groups_week = groupby(shows, fweek, ordered=True)
     for week, shows_week in groups_week.items():
