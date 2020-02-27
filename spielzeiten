@@ -216,7 +216,7 @@ class CapitolPalatin(Theater):
         return shows
 
     def _split_week_range(self, line):
-        match = re.match(r"([0-3][0-9])\.\s*([a-zA-Z]*)?\s*-\s*([0-3][0-9])\.\s*([a-zA-Z]*)", line)
+        match = re.match(r"([0-3][0-9])\.\s*([a-zA-Zäöü]*)?\s*-\s*([0-3][0-9])\.\s*([a-zA-Zäöü]*)", line)
         assert match is not None
         sd, sm, ed, em = match.groups()
         # If start and end are in the same month, the month is named only once
