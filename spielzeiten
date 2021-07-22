@@ -10,6 +10,7 @@ import re
 import requests
 import urllib.parse
 import webbrowser
+import warnings
 
 
 
@@ -207,7 +208,11 @@ class CapitolPalatin(Theater):
             if "Filmprogramm" in title:
                 *_, line = title.splitlines()
                 # First cell of header row contains date range
-                start, end = self._split_week_range(line)
+                # If it can't be parsed, skip the table
+                try:
+                    start, end = self._split_week_range(line)
+                except AssertionError:
+                    return []
                 days = [start + dt.timedelta(days=n) for n in range((end - start).days + 1)]
             # Movie row
             else:
